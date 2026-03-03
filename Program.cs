@@ -988,12 +988,15 @@ namespace DataCarverGUI
                             long currentOffset = extent.Item1;
                             long extentEnd = extent.Item2;
                             
-                            diskStream.Position = currentOffset;
-
                             while (_cleaning && currentOffset < extentEnd)
                             {
                                 int toRead = (int)Math.Min(bufferSize, extentEnd - currentOffset);
-                                int bytesRead = diskStream.Read(readBuffer, 0, toRead);
+                                int bytesRead;
+                                lock (diskStream)
+                                {
+                                    diskStream.Position = currentOffset;
+                                    bytesRead = diskStream.Read(readBuffer, 0, toRead);
+                                }
                                 if (bytesRead <= 0) break;
 
                                 processTask.Wait();
@@ -1009,8 +1012,11 @@ namespace DataCarverGUI
                                     if (patchedCount > 0)
                                     {
                                         try {
-                                            diskStream.Position = processOffset;
-                                            diskStream.Write(processBuffer, 0, processBytes);
+                                            lock (diskStream)
+                                            {
+                                                diskStream.Position = processOffset;
+                                                diskStream.Write(processBuffer, 0, processBytes);
+                                            }
                                         } catch (UnauthorizedAccessException) {
                                             Invoke((MethodInvoker)delegate {
                                                 cleanerStatusLabel.Text = "Access Denied by OS Volume Manager. Raw write blocked on this partition.";
@@ -1022,7 +1028,6 @@ namespace DataCarverGUI
 
                                 currentOffset += bytesRead;
                                 totalProcessed += bytesRead;
-                                diskStream.Position = currentOffset; 
 
                                 if (totalProcessed % (200 * 1024 * 1024) == 0)
                                 {
