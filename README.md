@@ -40,6 +40,20 @@ To compile a highly optimized, windowed `.exe` with the custom shield logo nativ
 - `/out:DataCarver.exe` - The final executable filename.
 - `Program.cs` - The main C# source file containing the engine architecture.
 
+## Application Tabs
+
+1. **Raw Disk Carver**
+   - **Purpose**: Scans the unallocated (empty) space of a physical drive to reconstruct lost, deleted, or orphaned files. 
+   - **Features**: Live parsing of discovered formats (PDF, JPG, ZIP, MP4, etc.), filtering by file type, direct file restoration to a `./RecoveredFiles/` directory, and an isolated UI renderer for natively previewing restored images. 
+
+2. **Test Normal Files**
+   - **Purpose**: A diagnostic area intended to help developers determine if file structures recovered by the Carver are actually valid and recognizable by standard Windows Graphics hooks. 
+   - **Features**: Users can test previously carved image blobs by directly pointing the interface renderer at them. It helps isolate whether a "broken image" result is corrupted on the disk itself or just unsupported by basic Windows APIs (like `webp`).
+
+3. **Data Cleaner**
+   - **Purpose**: Permanently destroys data leaks from deleted files lying dormant out of the operating system's reach. 
+   - **Features**: Rather than blinding writing zeros over the entire drive and slowly decreasing the SSD's lifespan, this engine specifically maps out empty space, hunts exclusively for file headers/footers in the raw bytes, and atomically overwrites only the exact signatures with randomized cryptographic data. 
+
 ## Usage Guide
 1. **Right-Click `DataCarver.exe`** and select **Run as Administrator**.
 2. Select your target drive letter from the dropdown box.
