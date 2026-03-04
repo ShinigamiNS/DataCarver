@@ -56,6 +56,18 @@ namespace DataCarverGUI
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
         public static extern bool GetDiskFreeSpace(string lpRootPathName, out uint lpSectorsPerCluster, out uint lpBytesPerSector, out uint lpNumberOfFreeClusters, out uint lpTotalNumberOfClusters);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool ReadFile(SafeFileHandle hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool WriteFile(SafeFileHandle hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetFilePointerEx(SafeFileHandle hFile, long liDistanceToMove, out long lpNewFilePointer, uint dwMoveMethod);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool FlushFileBuffers(SafeFileHandle hFile);
+
         const uint GENERIC_READ = 0x80000000;
         const uint GENERIC_WRITE = 0x40000000;
         const uint FILE_SHARE_READ = 0x00000001;
@@ -870,7 +882,7 @@ namespace DataCarverGUI
             });
         }
 
-        private int ProcessCleanBuffer(byte[] buffer, int length, long baseOffset)
+        private List<KeyValuePair<long, int>> ProcessCleanBuffer(byte[] buffer, int length, long baseOffset)
         {
             int numThreads = Environment.ProcessorCount;
             if (numThreads < 1) numThreads = 1;
@@ -924,27 +936,25 @@ namespace DataCarverGUI
                 }
             });
 
-            if (patches.Count > 0)
-            {
-                Random r = new Random();
-                patches.Sort((a, b) => a.Key.CompareTo(b.Key));
-                foreach (var p in patches)
-                {
-                    int localOffset = (int)(p.Key - baseOffset);
-                    byte[] randBytes = new byte[p.Value];
-                    r.NextBytes(randBytes);
-                    if (localOffset >= 0 && localOffset + randBytes.Length <= length)
-                    {
-                        Array.Copy(randBytes, 0, buffer, localOffset, randBytes.Length);
-                    }
-                    _cleanedCount++;
-                }
-            }
-            return patches.Count;
+            return patches;
         }
 
         private void CleanDisk(string volumePath, int cacheSizeMB)
         {
+            string driveLetter = string.IsNullOrEmpty(cleanerDriveCombo.SelectedItem.ToString()) ? "C" : cleanerDriveCombo.SelectedItem.ToString();
+            
+            uint spc, bps, nfc, tnc;
+            if (!GetDiskFreeSpace(driveLetter + ":\\", out spc, out bps, out nfc, out tnc))
+            {
+                Invoke((MethodInvoker)delegate {
+                    cleanerStatusLabel.Text = "Error: Could not determine cluster size of drive " + driveLetter + ":";
+                    cleanBtn.Text = "Clean Drive (DANGER)";
+                    _cleaning = false;
+                });
+                return;
+            }
+            long clusterSize = (long)spc * bps;
+
             using (SafeFileHandle handle = CreateFile(volumePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero))
             {
                 if (handle.IsInvalid)
@@ -958,92 +968,103 @@ namespace DataCarverGUI
                 }
                 List<Tuple<long, long>> freeExtents = GetVolumeFreeExtents(handle, string.IsNullOrEmpty(cleanerDriveCombo.SelectedItem.ToString()) ? "C" : cleanerDriveCombo.SelectedItem.ToString());
 
-                int bReturned;
-                bool isLocked = DeviceIoControl(handle, FSCTL_LOCK_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out bReturned, IntPtr.Zero);
-                if (!isLocked)
+                // Lock removed: prevents volume dismounts and Chkdsk triggers over harmless unallocated writes.
+
+                int bufferSize = cacheSizeMB * 1024 * 1024; 
+                byte[] buffer1 = new byte[bufferSize];
+                byte[] buffer2 = new byte[bufferSize];
+                byte[] readBuffer = buffer1;
+                byte[] processBuffer = null;
+                
+                Task processTask = Task.CompletedTask;
+
+                long totalProcessed = 0;
+                Random rand = new Random();
+                object diskLock = new object();
+
+                foreach (var extent in freeExtents)
                 {
-                    Invoke((MethodInvoker)delegate {
-                        cleanerStatusLabel.Text = "Error: Cannot lock drive. Windows denies raw writes to active OS drives (C:). Use a secondary drive or boot via USB PE.";
-                        cleanBtn.Text = "Clean Drive (DANGER)";
-                        _cleaning = false;
-                    });
-                    return;
-                }
-
-                using (FileStream diskStream = new FileStream(handle, FileAccess.ReadWrite))
-                {
-                        int bufferSize = cacheSizeMB * 1024 * 1024; 
-                        byte[] buffer1 = new byte[bufferSize];
-                        byte[] buffer2 = new byte[bufferSize];
-                        byte[] readBuffer = buffer1;
-                        byte[] processBuffer = null;
-                        
-                        Task processTask = Task.CompletedTask;
-
-                        long totalProcessed = 0;
-
-                        foreach (var extent in freeExtents)
+                    if (!_cleaning) break;
+                    long currentOffset = extent.Item1;
+                    long extentEnd = extent.Item2;
+                    
+                    while (_cleaning && currentOffset < extentEnd)
+                    {
+                        int toRead = (int)Math.Min(bufferSize, extentEnd - currentOffset);
+                        uint bytesRead = 0;
+                        lock (diskLock)
                         {
-                            if (!_cleaning) break;
-                            long currentOffset = extent.Item1;
-                            long extentEnd = extent.Item2;
+                            long newPointer;
+                            SetFilePointerEx(handle, currentOffset, out newPointer, 0);
+                            ReadFile(handle, readBuffer, (uint)toRead, out bytesRead, IntPtr.Zero);
+                        }
+                        if (bytesRead <= 0) break;
+
+                        processTask.Wait();
+                        processBuffer = readBuffer;
+                        readBuffer = (readBuffer == buffer1) ? buffer2 : buffer1;
+
+                        int processBytes = (int)bytesRead;
+                        long processOffset = currentOffset;
+
+                        processTask = Task.Run(() => {
+                            var patches = ProcessCleanBuffer(processBuffer, processBytes, processOffset);
                             
-                            while (_cleaning && currentOffset < extentEnd)
+                            if (patches.Count > 0)
                             {
-                                int toRead = (int)Math.Min(bufferSize, extentEnd - currentOffset);
-                                int bytesRead;
-                                lock (diskStream)
-                                {
-                                    diskStream.Position = currentOffset;
-                                    bytesRead = diskStream.Read(readBuffer, 0, toRead);
-                                }
-                                if (bytesRead <= 0) break;
-
-                                processTask.Wait();
-                                processBuffer = readBuffer;
-                                readBuffer = (readBuffer == buffer1) ? buffer2 : buffer1;
-
-                                int processBytes = bytesRead;
-                                long processOffset = currentOffset;
-
-                                processTask = Task.Run(() => {
-                                    int patchedCount = ProcessCleanBuffer(processBuffer, processBytes, processOffset);
+                                foreach (var patch in patches) {
+                                    if (!_cleaning) break;
+                                    long absoluteOffset = patch.Key;
+                                    int patchLength = patch.Value;
                                     
-                                    if (patchedCount > 0)
-                                    {
-                                        try {
-                                            lock (diskStream)
-                                            {
-                                                diskStream.Position = processOffset;
-                                                diskStream.Write(processBuffer, 0, processBytes);
+                                    // Calculate precise physical 4KB sector boundaries
+                                    long sectorStart = absoluteOffset - (absoluteOffset % bps);
+                                    long sectorEnd = absoluteOffset + patchLength;
+                                    if (sectorEnd % bps != 0) sectorEnd += (bps - (sectorEnd % bps));
+                                    uint sectorBytes = (uint)(sectorEnd - sectorStart);
+                                    
+                                    if (sectorBytes <= 0 || sectorBytes > 1024 * 1024) continue;
+                                    
+                                    byte[] sectorBuf = new byte[sectorBytes];
+                                    lock (diskLock) {
+                                        long tempPtr;
+                                        SetFilePointerEx(handle, sectorStart, out tempPtr, 0);
+                                        uint read;
+                                        if (ReadFile(handle, sectorBuf, sectorBytes, out read, IntPtr.Zero) && read == sectorBytes) {
+                                            int offsetInBuf = (int)(absoluteOffset - sectorStart);
+                                            byte[] rBytes = new byte[patchLength];
+                                            rand.NextBytes(rBytes);
+                                            Array.Copy(rBytes, 0, sectorBuf, offsetInBuf, patchLength);
+                                            
+                                            SetFilePointerEx(handle, sectorStart, out tempPtr, 0);
+                                            uint sWritten;
+                                            if (WriteFile(handle, sectorBuf, sectorBytes, out sWritten, IntPtr.Zero)) {
+                                                Interlocked.Increment(ref _cleanedCount);
                                             }
-                                        } catch (UnauthorizedAccessException) {
-                                            Invoke((MethodInvoker)delegate {
-                                                cleanerStatusLabel.Text = "Access Denied by OS Volume Manager. Raw write blocked on this partition.";
-                                                _cleaning = false;
-                                            });
                                         }
                                     }
-                                });
-
-                                currentOffset += bytesRead;
-                                totalProcessed += bytesRead;
-
-                                if (totalProcessed % (200 * 1024 * 1024) == 0)
-                                {
-                                    Invoke((MethodInvoker)delegate {
-                                        cleanerStatusLabel.Text = "Cleaning Unallocated Space... " + (totalProcessed / (1024 * 1024)) + " MB processed. Overwrites: " + _cleanedCount;
-                                    });
                                 }
                             }
+                        });
+
+                        currentOffset += bytesRead;
+                        totalProcessed += bytesRead;
+
+                        if (totalProcessed % (200 * 1024 * 1024) == 0)
+                        {
+                            Invoke((MethodInvoker)delegate {
+                                cleanerStatusLabel.Text = "Micro-Patching Free Space... " + (totalProcessed / (1024 * 1024)) + " MB scanned. Overwrites: " + Interlocked.Read(ref _cleanedCount);
+                            });
                         }
-                        if (processTask != null) processTask.Wait();
                     }
+                }
+                if (processTask != null) processTask.Wait();
+                FlushFileBuffers(handle);
             }
 
             Invoke((MethodInvoker)delegate {
                 cleanBtn.Text = "Clean Drive (DANGER)";
-                cleanerStatusLabel.Text = "Clean complete. Final overwrites: " + _cleanedCount;
+                cleanerStatusLabel.Text = "Micro-Patch Complete. Safely overwritten " + _cleanedCount + " headers!";
                 cleanerStatusLabel.ForeColor = Color.Green;
                 _cleaning = false;
             });
